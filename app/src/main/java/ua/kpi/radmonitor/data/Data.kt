@@ -1,4 +1,11 @@
-package ua.kpi.radmonitor
+package ua.kpi.radmonitor.data
+import ua.kpi.radmonitor.*
+import ua.kpi.radmonitor.domain.*
+import ua.kpi.radmonitor.data.*
+import ua.kpi.radmonitor.viewmodel.*
+import ua.kpi.radmonitor.device.*
+import ua.kpi.radmonitor.ui.*
+
 
 import android.content.Context
 import androidx.room.*
@@ -20,20 +27,38 @@ interface MeasurementDao {
     @Query("SELECT * FROM measurements ORDER BY timestamp DESC")
     fun observe(): Flow<List<Measurement>>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsert(item: Measurement)
+    @Upsert suspend fun write(item: Measurement)
+    @Insert suspend fun audit(event: ChangeEvent)
+    @Transaction suspend fun upsert(item: Measurement) {
+        write(item)
+        audit(ChangeEvent(measurementId = item.id, action = "Збереження"))
+    }
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE) suspend fun upsertAll(items: List<Measurement>)
+    @Transaction suspend fun upsertAll(items: List<Measurement>) { items.forEach { upsert(it) } }
+    @Query("SELECT * FROM changes WHERE measurementId=:id ORDER BY changedAt DESC")
+    fun history(id: String): Flow<List<ChangeEvent>>
+    @Query("SELECT type, COUNT(*) AS count, AVG(doseRate) AS average, MAX(doseRate) AS peak FROM measurements GROUP BY type")
+    fun statistics(): Flow<List<TypeStatistics>>
 
     @Query("DELETE FROM measurements WHERE id=:id") suspend fun delete(id: String)
 }
 
-@Database(entities = [Measurement::class], version = 1, exportSchema = false)
+@Entity(tableName = "changes", foreignKeys = [ForeignKey(entity = Measurement::class, parentColumns = ["id"], childColumns = ["measurementId"], onDelete = ForeignKey.CASCADE)], indices = [Index("measurementId")])
+data class ChangeEvent(@PrimaryKey(autoGenerate = true) val eventId: Long = 0, val measurementId: String, val action: String, val changedAt: Long = System.currentTimeMillis())
+data class TypeStatistics(val type: String, val count: Int, val average: Double, val peak: Double)
+
+@Database(entities = [Measurement::class, ChangeEvent::class], version = 2, exportSchema = false)
 abstract class MonitorDatabase : RoomDatabase() {
     abstract fun dao(): MeasurementDao
 
     companion object {
         fun create(c: Context) =
-            Room.databaseBuilder(c, MonitorDatabase::class.java, "monitor.db").build()
+            Room.databaseBuilder(c, MonitorDatabase::class.java, "monitor.db").addMigrations(object : androidx.room.migration.Migration(1,2) {
+                override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                    db.execSQL("CREATE TABLE IF NOT EXISTS changes (eventId INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, measurementId TEXT NOT NULL, action TEXT NOT NULL, changedAt INTEGER NOT NULL, FOREIGN KEY(measurementId) REFERENCES measurements(id) ON DELETE CASCADE)")
+                    db.execSQL("CREATE INDEX IF NOT EXISTS index_changes_measurementId ON changes(measurementId)")
+                }
+            }).build()
     }
 }
 
@@ -41,7 +66,7 @@ data class LoginRequest(val email: String, val password: String)
 
 data class RegistrationRequest(val name: String, val email: String, val password: String)
 
-data class Session(val token: String, val role: String)
+data class Session(val token: String, val role: String, val expiresAt: Long = System.currentTimeMillis() + 3600000)
 
 interface MonitorApi {
     @POST("register") suspend fun register(@Body body: RegistrationRequest): Session
@@ -56,9 +81,17 @@ interface MonitorApi {
  * Відтворюваний mock API: Retrofit виконує JSON/HTTP pipeline через OkHttp. У деморежимі дані не
  * передаються сторонньому серверу.
  */
-class DemoApiInterceptor : Interceptor {
+class DemoApiInterceptor(context: Context? = null) : Interceptor {
+    private val preferences = context?.getSharedPreferences("demo-api", 0)
+    private var expiresAt = preferences?.getLong("expiresAt", 0) ?: 0
+    private fun issue(role: String): Session {
+        expiresAt = System.currentTimeMillis() + 3600000
+        issuedToken = "demo.$role.$expiresAt.${java.util.UUID.randomUUID()}"
+        preferences?.edit()?.putString("token", issuedToken)?.putLong("expiresAt", expiresAt)?.apply()
+        return Session(issuedToken!!, role, expiresAt)
+    }
     @Volatile var scenario = "Успіх"
-    private var issuedToken: String? = null
+    private var issuedToken: String? = preferences?.getString("token", null)
     private val accounts =
         mutableMapOf("operator@demo.ua" to "Demo12345", "viewer@demo.ua" to "Demo12345")
 
@@ -81,8 +114,7 @@ class DemoApiInterceptor : Interceptor {
                         "{}"
                     } else {
                         accounts[r.email] = r.password
-                        issuedToken = java.util.UUID.randomUUID().toString()
-                        gson.toJson(Session(issuedToken!!, "viewer"))
+                        gson.toJson(issue("viewer"))
                     }
                 }
                 request.url.encodedPath.endsWith("login") -> {
@@ -90,19 +122,13 @@ class DemoApiInterceptor : Interceptor {
                     request.body?.writeTo(buffer)
                     val login = gson.fromJson(buffer.readUtf8(), LoginRequest::class.java)
                     if (accounts[login.email] == login.password) {
-                        issuedToken = java.util.UUID.randomUUID().toString()
-                        gson.toJson(
-                            Session(
-                                issuedToken!!,
-                                if (login.email == "operator@demo.ua") "operator" else "viewer",
-                            )
-                        )
+                        gson.toJson(issue(if (login.email == "operator@demo.ua") "operator" else "viewer"))
                     } else {
                         code = 401
                         "{}"
                     }
                 }
-                request.header("Authorization") != "Bearer $issuedToken" || issuedToken == null -> {
+                request.header("Authorization") != "Bearer $issuedToken" || issuedToken == null || System.currentTimeMillis() >= expiresAt || scenario == "Сеанс завершено" -> {
                     code = 401
                     "{}"
                 }
@@ -127,14 +153,29 @@ class DemoApiInterceptor : Interceptor {
 
 class MonitorRepository(private val dao: MeasurementDao, private val context: Context) {
     val records = dao.observe()
-    val mock = DemoApiInterceptor()
+    val mock = DemoApiInterceptor(context)
+    private val authPreferences = context.getSharedPreferences("auth", 0)
+    private var authToken: String? = authPreferences.getString("token", null)
+    private val authInterceptor = Interceptor { chain ->
+        val request = chain.request()
+        val authenticated = if (request.header("Authorization") == null && authToken != null)
+            request.newBuilder().header("Authorization", "Bearer $authToken").build() else request
+        chain.proceed(authenticated)
+    }
+    fun rememberSession(session: Session) {
+        authToken = session.token
+        authPreferences.edit().putString("token", session.token).putLong("expiresAt", session.expiresAt).apply()
+    }
+    fun clearSession() { authToken = null; authPreferences.edit().clear().apply() }
+    fun history(id: String) = dao.history(id)
+    val statistics = dao.statistics()
     var remoteMode = false
         private set
 
     var api: MonitorApi =
         Retrofit.Builder()
             .baseUrl("https://demo.invalid/")
-            .client(OkHttpClient.Builder().addInterceptor(mock).build())
+            .client(OkHttpClient.Builder().addInterceptor(authInterceptor).addInterceptor(mock).build())
             .addConverterFactory(GsonConverterFactory.create())
             .build()
             .create(MonitorApi::class.java)
@@ -152,7 +193,7 @@ class MonitorRepository(private val dao: MeasurementDao, private val context: Co
             }
         }
         val client =
-            OkHttpClient.Builder()
+            OkHttpClient.Builder().addInterceptor(authInterceptor)
                 .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
         if (!useRemote) client.addInterceptor(mock)
@@ -166,8 +207,8 @@ class MonitorRepository(private val dao: MeasurementDao, private val context: Co
         remoteMode = useRemote
     }
 
-    suspend fun login(body: LoginRequest): Session { checkNetwork(); return api.login(body) }
-    suspend fun register(body: RegistrationRequest): Session { checkNetwork(); return api.register(body) }
+    suspend fun login(body: LoginRequest): Session { checkNetwork(); return api.login(body).also(::rememberSession) }
+    suspend fun register(body: RegistrationRequest): Session { checkNetwork(); return api.register(body).also(::rememberSession) }
     private fun checkNetwork() {
         if (!remoteMode) return
         val cm =

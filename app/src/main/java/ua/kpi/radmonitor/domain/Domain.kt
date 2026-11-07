@@ -1,4 +1,11 @@
-package ua.kpi.radmonitor
+package ua.kpi.radmonitor.domain
+import ua.kpi.radmonitor.*
+import ua.kpi.radmonitor.domain.*
+import ua.kpi.radmonitor.data.*
+import ua.kpi.radmonitor.viewmodel.*
+import ua.kpi.radmonitor.device.*
+import ua.kpi.radmonitor.ui.*
+
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
@@ -53,6 +60,8 @@ object MonitorLogic {
                     (type == "Усі" || it.type == type)
             }
         return when (sort) {
+            "Назва" -> result.sortedBy { it.name.lowercase() }
+            "Тип" -> result.sortedWith(compareBy<Measurement> { it.type }.thenBy { it.name })
             "Показник" -> result.sortedByDescending { it.doseRate }
             "Потужність" -> result.sortedByDescending { it.powerMw }
             else -> result.sortedByDescending { it.timestamp }

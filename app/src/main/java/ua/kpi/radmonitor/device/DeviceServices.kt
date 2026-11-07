@@ -1,4 +1,11 @@
-package ua.kpi.radmonitor
+package ua.kpi.radmonitor.device
+import ua.kpi.radmonitor.*
+import ua.kpi.radmonitor.domain.*
+import ua.kpi.radmonitor.data.*
+import ua.kpi.radmonitor.viewmodel.*
+import ua.kpi.radmonitor.device.*
+import ua.kpi.radmonitor.ui.*
+
 
 import android.app.*
 import android.content.*
@@ -16,6 +23,16 @@ import kotlinx.coroutines.flow.callbackFlow
 
 /** Телефон не є дозиметром. Акселерометр показує лише рух пристрою. */
 class DeviceSensors(private val context: Context) {
+    fun vectors(sensorType: Int) = callbackFlow<VectorReading?> {
+        val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        val sensor = manager.getDefaultSensor(sensorType)
+        val listener = object : SensorEventListener {
+            override fun onSensorChanged(e: SensorEvent) { trySend(VectorReading(e.values[0].toDouble(), e.values[1].toDouble(), e.values[2].toDouble(), android.os.SystemClock.elapsedRealtime())) }
+            override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
+        }
+        if (sensor == null) trySend(null) else manager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL)
+        awaitClose { manager.unregisterListener(listener) }
+    }
     fun acceleration() =
         callbackFlow<Double?> {
             val manager = context.getSystemService(Context.SENSOR_SERVICE) as SensorManager
@@ -67,35 +84,11 @@ class ReminderWorker(c: Context, p: WorkerParameters) : CoroutineWorker(c, p) {
                 .getBoolean("notifications", false)
         )
             return Result.success()
-        val nm = applicationContext.getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(
-            NotificationChannel(
-                "monitor",
-                "Навчальний моніторинг",
-                NotificationManager.IMPORTANCE_DEFAULT,
-            )
-        )
-        val intent =
-            PendingIntent.getActivity(
-                applicationContext,
-                0,
-                Intent(applicationContext, MainActivity::class.java),
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            )
-        try {
-            nm.notify(
-                4,
-                NotificationCompat.Builder(applicationContext, "monitor")
-                    .setSmallIcon(android.R.drawable.ic_dialog_info)
-                    .setContentTitle("Перевірка навчальних даних")
-                    .setContentText("Перегляньте журнал постів і стан сенсора телефону.")
-                    .setContentIntent(intent)
-                    .setAutoCancel(true)
-                    .build(),
-            )
-        } catch (_: SecurityException) {
-            return Result.failure()
-        }
+        val category = inputData.getString("category") ?: "reminder"
+        val eventId = inputData.getInt("eventId", id.hashCode())
+        try { EventNotifications.show(applicationContext, category, eventId, inputData.getString("text") ?: "Перегляньте журнал постів і сенсори.") }
+        catch (_: SecurityException) { return Result.failure() }
+
         return Result.success()
     }
 }
@@ -104,13 +97,14 @@ object FilesService {
     /** Зберігаємо копію з контрольованим ім'ям, без шляхів із зовнішнього URI. */
     fun copyDocument(c: Context, uri: Uri): File {
         val type = c.contentResolver.getType(uri) ?: error("Не вдалося визначити MIME")
-        require(type in listOf("image/jpeg", "image/png", "application/pdf")) {
-            "Оберіть JPEG, PNG або PDF"
+        require(type in listOf("image/jpeg", "image/png", "application/pdf", "application/vnd.openxmlformats-officedocument.wordprocessingml.document")) {
+            "Оберіть JPEG, PNG, PDF або DOCX"
         }
         val ext =
             when (type) {
                 "image/jpeg" -> "jpg"
                 "image/png" -> "png"
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" -> "docx"
                 else -> "pdf"
             }
         val dir = File(c.filesDir, "documents").apply { mkdirs() }
